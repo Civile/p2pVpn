@@ -1,163 +1,169 @@
-# p2p-holepunch (Fase 2 — control plane)
+# p2p-holepunch
 
-Sistema in Rust ispirato a Tailscale: un **control plane** con IP pubblico
-(backoffice web + login + segnalazione) e un **client** che, dietro NAT, si
-autentica via browser e stabilisce una connessione **P2P diretta** con un altro
-dispositivo dello stesso account tramite **UDP hole punching**.
+A Tailscale-inspired system in Rust: a **control plane** with a public IP
+(web backoffice + login + signaling) and a **client** that, behind NAT,
+authenticates via the browser and establishes a **direct P2P connection** with
+another device on the same account through **UDP hole punching**.
 
-Rispetto alla Fase 1 sono stati aggiunti:
+Features:
 
-- **Backoffice web** (login/registrazione) per vedere e collegare i dispositivi;
-- **Login del client via browser** (device-code flow, come `tailscale up`):
-  il client apre il browser, tu approvi, il dispositivo resta legato all'account;
-- **Account e persistenza** (SQLite): utenti, dispositivi, sessioni.
+- **Web backoffice** (login/registration) to see and connect your devices;
+- **Browser-based client login** (device-code flow, like `tailscale up`): the
+  client opens the browser, you approve, and the device stays bound to the account;
+- **Accounts and persistence** (SQLite): users, devices, sessions;
+- **Automatic full mesh**: online devices are connected all-to-all via hole punching;
+- **Exit node** (VPN data plane, feature `vpn`): route your traffic through
+  another device over an encrypted **WireGuard** tunnel.
 
-## Struttura
+## Layout
 
 ```
 Cargo.toml
 src/
-  lib.rs         # dichiarazione moduli + re-export protocollo
-  proto.rs       # protocollo condiviso (messaggi JSON TCP/UDP)
-  db.rs          # storage SQLite: utenti, device, sessioni, device-auth
-  web.rs         # backoffice web (axum): login, /devices, mesh, exit node
-  vpn.rs         # data plane VPN (feature `vpn`): TUN + forwarding (exit node)
-  bin/server.rs  # control plane: HTTP + segnalazione TCP + UDP (sulla VPS)
-  bin/client.rs  # client CLI per i dispositivi (login via browser + hole punch)
-client-tauri/    # client desktop (Tauri): stessa logica, UI in HTML/JS
-EXIT-NODE.md     # runbook del data plane VPN (exit node)
+  lib.rs         # module declarations + protocol re-export
+  proto.rs       # shared protocol (TCP/UDP JSON messages)
+  db.rs          # SQLite storage: users, devices, sessions, device-auth
+  web.rs         # web backoffice (axum): login, /devices, mesh, exit node
+  vpn.rs         # VPN data plane (feature `vpn`): TUN + WireGuard forwarding
+  bin/server.rs  # control plane: HTTP + TCP signaling + UDP (runs on the VPS)
+  bin/client.rs  # CLI client for devices (browser login + hole punch)
+client-tauri/    # desktop client (Tauri): same logic, UI in HTML/JS
+EXIT-NODE.md     # runbook for the VPN data plane (exit node)
 ```
 
-La libreria è divisa per feature: il control plane (axum + SQLite) sta dietro la
-feature `server` (attiva di default); il data plane VPN (TUN) dietro la feature
-`vpn`. I client usano la libreria con `default-features = false` e ottengono
-**solo il modulo `proto`**, senza tirarsi dietro SQLite/axum.
+The library is split by feature: the control plane (axum + SQLite) is behind the
+`server` feature (on by default); the VPN data plane (TUN) is behind the `vpn`
+feature. Clients depend on the library with `default-features = false` and get
+**only the `proto` module**, without pulling in SQLite/axum.
 
-## Due varianti di client (intercambiabili)
+## Two interchangeable clients
 
-Stesso protocollo, stesso server: puoi anche collegare un client CLI con uno Tauri.
+Same protocol, same server — you can even connect a CLI client to a Tauri one.
 
-- **CLI** (`src/bin/client.rs`) — da terminale, un singolo binario nativo.
-- **Desktop / Tauri** (`client-tauri/`) — app con finestra, UI in HTML/JS e rete
-  in Rust. Vedi [`client-tauri/README.md`](client-tauri/README.md).
+- **CLI** (`src/bin/client.rs`) — terminal, a single native binary.
+- **Desktop / Tauri** (`client-tauri/`) — windowed app, UI in HTML/JS and
+  networking in Rust. See [`client-tauri/README.md`](client-tauri/README.md).
 
-Tre servizi sullo stesso processo `server`:
+Three services in the same `server` process:
 
-| Servizio | Porta di default | Ruolo |
-|----------|------------------|-------|
-| HTTP     | `8080`           | backoffice web + API del device-code flow |
-| TCP      | `47100`          | segnalazione (il client si autentica con la `auth_key`) |
-| UDP      | `47101`          | apprende l'endpoint UDP pubblico per l'hole punching |
+| Service | Default port | Role |
+|---------|--------------|------|
+| HTTP    | `8080`       | web backoffice + device-code flow API |
+| TCP     | `47100`      | signaling (the client authenticates with its `auth_key`) |
+| UDP     | `47101`      | learns the public UDP endpoint for hole punching |
 
-## Compilazione
+## Build
 
 ```bash
 cargo build --release
-# binari in target/release/server  e  target/release/client
+# binaries in target/release/server  and  target/release/client
 ```
 
-## Come funziona (flusso "alla Tailscale")
+## How it works (the "Tailscale-like" flow)
 
-1. Ti registri/accedi al **backoffice** (`http://<server>:8080`).
-2. Su un dispositivo avvii il **client**: apre il browser sulla pagina di
-   approvazione. Approvi → il dispositivo riceve un'identità persistente
-   (`device_id` + `auth_key`) salvata in `~/.p2p-holepunch/config.json`.
-3. Ripeti su ogni dispositivo che vuoi aggiungere all'account.
-4. **Mesh automatica:** appena un dispositivo è online e pubblica il suo
-   endpoint UDP, il server lo collega **tutti-con-tutti** agli altri dispositivi
-   online dell'account (hole punching). Non serve alcuna azione manuale.
-5. **Exit node (opzionale):** nel backoffice puoi marcare uno o più dispositivi
-   come *disponibili a fare da exit node*. Questa disponibilità viene comunicata
-   agli altri, che potranno poi sceglierne uno dal client.
+1. Register/sign in to the **backoffice** (`http://<server>:8080`).
+2. On a device, start the **client**: it opens the browser on the approval page.
+   Approve → the device gets a persistent identity (`device_id` + `auth_key`),
+   saved to `~/.p2p-holepunch/config.json`.
+3. Repeat on every device you want to add to the account.
+4. **Automatic mesh:** as soon as a device is online and publishes its UDP
+   endpoint, the server connects it **all-to-all** with the account's other
+   online devices (hole punching). No manual action needed.
+5. **Exit node (optional):** in the backoffice you can mark one or more devices
+   as *available as an exit node*. This availability is advertised to the
+   others, which can then select one from the client.
 
-> ⚠️ L'exit node oggi è al livello di **coordinamento**: il server marca e
-> annuncia quali dispositivi sono disponibili come uscita. Il **routing vero del
-> traffico** attraverso l'exit node (interfaccia TUN + forwarding) è il passo
-> successivo e non è ancora implementato.
+> ⚠️ The VPN tunnel is **WireGuard-encrypted** (crypto verified by unit tests)
+> and the control plane assigns virtual IPs (IPAM); actually routing traffic,
+> however, requires the **TUN** interface (root privileges) and must be tested on
+> a real host. See [`EXIT-NODE.md`](EXIT-NODE.md).
 
-## Test in locale (una sola macchina)
+## Local test (single machine)
 
 ```bash
 # 1) Server (control plane)
 cargo run --bin server
-# Backoffice su http://127.0.0.1:8080
+# Backoffice on http://127.0.0.1:8080
 
-# 2) Apri il browser su http://127.0.0.1:8080 e REGISTRATI.
+# 2) Open http://127.0.0.1:8080 in the browser and REGISTER.
 
-# 3) Primo client (apre il browser per l'approvazione)
+# 3) First client (opens the browser to approve)
 cargo run --bin client -- "laptop"
 
-# 4) Altri client (quanti vuoi)
-cargo run --bin client -- "telefono"
-cargo run --bin client -- "nas-casa"
+# 4) More clients (as many as you want)
+cargo run --bin client -- "phone"
+cargo run --bin client -- "home-nas"
 
-# I dispositivi si collegano da soli (mesh). In ogni terminale comparirà,
-# per ciascun peer:
+# The devices connect on their own (mesh). Each client terminal shows, per peer:
 #    [Mesh] Peer '...' @ ... → hole punching
 #    ✅ Connessione P2P diretta stabilita ...
 #
-# (Facoltativo) Nel backoffice -> Dispositivi puoi marcare un dispositivo come
-# exit node: comparirà come "[disponibile come exit node]" nei log degli altri.
+# (Optional) In the backoffice -> Devices you can mark a device as an exit node:
+# it shows up as "[disponibile come exit node]" in the other clients' logs.
 ```
 
-> Nota: sulla stessa macchina i client condividono `~/.p2p-holepunch/config.json`.
-> Per provarne più d'uno in locale usa `HOME` diverse, es.
+> Note: on the same machine clients share `~/.p2p-holepunch/config.json`. To run
+> more than one locally, use different `HOME`s, e.g.
 > `HOME=/tmp/h1 P2P_HTTP_PORT=8091 cargo run --bin client`.
 
-> In locale non c'è NAT, quindi il "buco" è banale: serve a validare tutta la
-> catena (login, account, segnalazione) prima di andare sulla VPS.
+> Locally there is no NAT, so the "hole" is trivial: it just validates the whole
+> chain (login, accounts, signaling) before going to the VPS.
 >
-> Le porte di default sono **8080/tcp** (backoffice), **47100/tcp**
-> (segnalazione) e **47101/udp**. Se la 8080 è occupata, avvia con
-> `HTTP_PORT=8091 PUBLIC_URL=http://127.0.0.1:8091 cargo run --bin server` e il
-> client con `P2P_HTTP_PORT=8091`.
+> Default ports are **8080/tcp** (backoffice), **47100/tcp** (signaling) and
+> **47101/udp**. If 8080 is taken, start with
+> `HTTP_PORT=8091 PUBLIC_URL=http://127.0.0.1:8091 cargo run --bin server` and the
+> client with `P2P_HTTP_PORT=8091`.
 
-### Variabili d'ambiente
+### Environment variables
 
 **Server:** `DB_PATH` (default `data.db`), `HTTP_PORT` (default `8080`),
-`PUBLIC_URL` (default `http://127.0.0.1:<HTTP_PORT>`, usato nei link del
-device-code flow — in produzione mettere l'URL pubblico).
+`PUBLIC_URL` (default `http://127.0.0.1:<HTTP_PORT>`, used in the device-code
+flow links — in production set the public URL).
 
-**Client:** `P2P_SERVER` (IP/host del server), `P2P_HTTP_PORT`, `P2P_TCP_PORT`,
-`P2P_UDP_PORT`. In alternativa modifica le costanti in cima a `src/bin/client.rs`.
+**Client:** `P2P_SERVER` (server IP/host), `P2P_HTTP_PORT`, `P2P_TCP_PORT`,
+`P2P_UDP_PORT`. Alternatively edit the constants at the top of `src/bin/client.rs`.
 
-Comandi utili del client:
+Handy client commands:
 
 ```bash
-client               # login (se serve) + attesa collegamento
-client "Nome device" # imposta il nome del dispositivo al primo login
-client --reset       # cancella la config locale (rifà il login)
+client                 # login (if needed) + wait for connection
+client "Device name"   # set the device name at first login
+client --use-exit NAME # route traffic through exit node NAME (needs feature vpn)
+client --exit-node     # act as an exit node for the others (needs feature vpn)
+client --reset         # delete the local config (re-run the login)
 ```
 
-## Deploy sulla VPS DigitalOcean
+## Deploy on a DigitalOcean VPS
 
-1. Configura il client con l'IP pubblico del droplet: costante `SERVER_IP` in
-   `src/bin/client.rs` oppure `P2P_SERVER=<ip>` a runtime.
-2. Ricompila il client per i tuoi dispositivi.
-3. Apri le porte nel firewall (es. `ufw`):
+1. Point the client at the droplet's public IP: constant `SERVER_IP` in
+   `src/bin/client.rs`, or `P2P_SERVER=<ip>` at runtime.
+2. Rebuild the client for your devices.
+3. Open the firewall ports (e.g. `ufw`):
    ```bash
-   sudo ufw allow 8080/tcp    # backoffice web
-   sudo ufw allow 47100/tcp   # segnalazione
+   sudo ufw allow 8080/tcp    # web backoffice
+   sudo ufw allow 47100/tcp   # signaling
    sudo ufw allow 47101/udp   # hole punching
    ```
-4. Avvia il server (dietro `systemd` / `tmux`), impostando l'URL pubblico:
+4. Start the server (under `systemd` / `tmux`), setting the public URL:
    ```bash
-   PUBLIC_URL=http://<ip-o-dominio>:8080 ./server
+   PUBLIC_URL=http://<ip-or-domain>:8080 ./server
    ```
-5. Registrati dal backoffice, poi avvia il client su ogni dispositivo.
+5. Register in the backoffice, then start the client on each device.
 
-> In produzione metti il backoffice **dietro HTTPS** (reverse proxy nginx/caddy):
-> le password e i cookie di sessione viaggiano in chiaro sulla 8080. Vedi sotto.
+> In production put the backoffice **behind HTTPS** (nginx/caddy reverse proxy):
+> passwords and session cookies travel in clear text on 8080.
 
-## Limiti noti (prossime fasi)
+## Known limitations (next steps)
 
-- **HTTP in chiaro:** il backoffice non fa TLS. In produzione va messo dietro un
-  reverse proxy HTTPS (caddy/nginx) e `PUBLIC_URL=https://...`.
-- **Exit node — routing da validare:** il tunnel è **cifrato con WireGuard**
-  (crypto verificata da unit test) e il control plane assegna IP virtuali
-  (IPAM); l'instradamento reale del traffico richiede però la **TUN** (privilegi
-  root) e va provato sul campo. Vedi [`EXIT-NODE.md`](EXIT-NODE.md).
-- **NAT simmetrico:** può rimappare le porte in modo imprevedibile; in quel caso
-  l'hole punching diretto fallisce e serve un **relay** via server (tipo DERP).
-- **Nessuna cifratura del traffico P2P** né keep-alive del buco NAT dopo il
-  collegamento: base didattica, non ancora una VPN sicura end-to-end.
+- **Plain HTTP:** the backoffice does not do TLS. In production put it behind an
+  HTTPS reverse proxy (nginx/caddy) with `PUBLIC_URL=https://...`.
+- **Exit node — routing to validate:** the tunnel is **WireGuard-encrypted**
+  (crypto verified by unit tests) and the control plane assigns virtual IPs
+  (IPAM); actually routing traffic requires the **TUN** interface (root) and must
+  be tested on a real host. See [`EXIT-NODE.md`](EXIT-NODE.md).
+- **Symmetric NAT:** it can remap ports unpredictably; in that case direct hole
+  punching fails and a server **relay** (DERP-style) is needed — not present yet.
+- **Mesh demo traffic:** outside the exit-node tunnel, the mesh currently just
+  exchanges PING datagrams to prove the direct path; it is not an encrypted
+  general-purpose data channel yet.
+```

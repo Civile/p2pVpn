@@ -2,10 +2,10 @@
 name = "p2p-client"
 version = "0.1.0"
 edition = "2021"
-description = "Client desktop (Tauri) per la rete P2P: login via browser + hole punching"
+description = "Desktop client (Tauri) for the P2P network: browser login + hole punching"
 
 [lib]
-# Tauri v2: la logica sta nella lib `app_lib`, il binario la avvia.
+# Tauri v2: the logic lives in the `app_lib` lib, the binary launches it.
 name = "app_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
