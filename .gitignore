@@ -1,0 +1,16 @@
+# Build artifacts (Rust / Cargo)
+target/
+
+# Tauri: schemi/artefatti generati da tauri-build
+client-tauri/src-tauri/gen/
+
+# Database SQLite del control plane (dati locali, non versionare)
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+
+# Backup
+**/*.rs.bk

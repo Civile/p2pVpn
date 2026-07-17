@@ -1,0 +1,55 @@
+[package]
+name = "p2p-holepunch"
+version = "0.2.0"
+edition = "2021"
+description = "Control plane (backoffice + login) + segnalazione + UDP hole punching in Rust"
+
+# Libreria condivisa: protocollo di controllo, storage SQLite e backoffice web.
+[lib]
+name = "p2p_holepunch"
+path = "src/lib.rs"
+
+# Binario del Server / control plane (da compilare per Linux / DigitalOcean).
+# Richiede la feature `server` (axum + SQLite). Attiva di default.
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+required-features = ["server"]
+
+# Binario del Client (da compilare per i tuoi dispositivi).
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[features]
+# La feature `server` abilita il control plane (backoffice + storage). Il client
+# (incluso quello Tauri) usa la libreria con `default-features = false`: ottiene
+# solo il modulo `proto`, senza tirarsi dietro axum/SQLite/argon2.
+default = ["server"]
+server = ["dep:axum", "dep:rusqlite", "dep:argon2", "dep:rand_core"]
+# Data plane VPN (exit node): interfaccia TUN + forwarding. Richiede privilegi
+# root a runtime; da eseguire su un host reale (tipicamente Linux per l'uscita).
+vpn = ["dep:tun", "dep:boringtun", "dep:getrandom", "dep:base64"]
+
+[dependencies]
+# Runtime asincrono (usato da segnalazione e backoffice).
+tokio = { version = "1", features = ["full"] }
+# Serializzazione/deserializzazione dei messaggi di controllo e delle API JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# --- solo con feature `server` ---
+# Backoffice web (routing HTTP, form, query).
+axum = { version = "0.8", features = ["form", "query"], optional = true }
+# Storage: SQLite embedded (bundled = compila SQLite, nessuna dipendenza di sistema).
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+# Hashing password (argon2) + RNG per token/chiavi.
+argon2 = { version = "0.5", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+# --- solo con feature `vpn` ---
+# Interfaccia TUN (async). Il routing/NAT lato exit è gestito con comandi di
+# sistema (vedi EXIT-NODE.md).
+tun = { version = "0.8", features = ["async"], optional = true }
+# Cifratura del tunnel: WireGuard userspace (boringtun, che ri-esporta X25519).
+boringtun = { version = "0.7", optional = true }
+getrandom = { version = "0.2", optional = true }
+base64 = { version = "0.22", optional = true }
