@@ -55,7 +55,7 @@ module.exports = {
     production: {
       user: 'root',
       // TODO: sostituisci con l'IP del droplet (o abc.edoardocasella.it dopo il DNS).
-      host: 'IP_DEL_DROPLET',
+      host: '188.166.36.30',
       ref: 'origin/main',
       repo: 'https://github.com/Civile/p2pVpn.git',
       path: '/var/www/vpn',
