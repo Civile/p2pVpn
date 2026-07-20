@@ -65,9 +65,12 @@ module.exports = {
 
       // Eseguito sul server dopo ogni pull: build del binario e reload pm2.
       // `--update-env` ricarica anche le variabili d'ambiente definite sopra.
+      // Il primo comando carica il PATH di cargo: pm2 deploy usa una shell
+      // non-interattiva che NON legge ~/.bashrc, quindi ~/.cargo/bin va aggiunto a mano.
       'post-deploy': [
+        'source $HOME/.cargo/env',
         'cargo build --release --bin server',
-        'pm2 startOrReload deploy/ecosystem.config.js --update-env',
+        'pm2 startOrRestart deploy/ecosystem.config.js --only vpn-control-plane --update-env',
         'pm2 save',
       ].join(' && '),
     },
