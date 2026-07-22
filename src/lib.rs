@@ -18,5 +18,9 @@ pub mod web;
 #[cfg(feature = "vpn")]
 pub mod vpn;
 
+// Routing automatico full-tunnel (client VPN): presente solo con la feature `vpn`.
+#[cfg(feature = "vpn")]
+pub mod route;
+
 // Re-export del protocollo per compatibilità: `p2p_holepunch::ClientMessage`, ecc.
 pub use proto::{ClientMessage, ServerMessage, UdpMessage};

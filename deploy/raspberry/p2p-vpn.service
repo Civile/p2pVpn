@@ -1,0 +1,29 @@
+# Unit systemd di RIFERIMENTO per l'avvio automatico del client come exit node.
+#
+# Di norma NON serve installarla a mano: il binario la genera e la abilita con
+#   sudo p2p-client --install-service --exit-node
+# (che imposta HOME e il percorso reale del binario). Questa copia serve solo
+# come riferimento / installazione manuale.
+#
+# Installazione manuale:
+#   sudo cp deploy/raspberry/p2p-vpn.service /etc/systemd/system/p2p-vpn.service
+#   # adatta HOME= all'utente che ha fatto il login (dove sta ~/.p2p-holepunch)
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now p2p-vpn
+
+[Unit]
+Description=P2P VPN client (connessione all'avvio)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Home dell'utente che ha eseguito il login (contiene ~/.p2p-holepunch/config.json).
+Environment=HOME=/home/pi
+ExecStart=/usr/local/bin/p2p-client --exit-node
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

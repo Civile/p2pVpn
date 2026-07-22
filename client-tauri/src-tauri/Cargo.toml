@@ -17,5 +17,7 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+# TLS per parlare HTTPS col backoffice in produzione (device-code login).
+tokio-native-tls = "0.3"
 # Riusa SOLO il protocollo condiviso (proto), senza SQLite/axum.
 p2p-holepunch = { path = "../..", default-features = false }

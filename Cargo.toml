@@ -37,6 +37,9 @@ tokio = { version = "1", features = ["full"] }
 # Serialization/deserialization of control messages and JSON APIs.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TLS per il client CLI: parla HTTPS col backoffice in produzione (device-code
+# login). Su macOS usa Security.framework, niente OpenSSL da installare.
+tokio-native-tls = "0.3"
 # --- only with the `server` feature ---
 # Web backoffice (HTTP routing, forms, query).
 axum = { version = "0.8", features = ["form", "query"], optional = true }
@@ -53,3 +56,11 @@ tun = { version = "0.8", features = ["async"], optional = true }
 boringtun = { version = "0.7", optional = true }
 getrandom = { version = "0.2", optional = true }
 base64 = { version = "0.22", optional = true }
+
+# --- cross-compilation to Linux (e.g. Raspberry Pi aarch64) ---
+# On non-macOS targets `native-tls` uses OpenSSL. Building OpenSSL from source
+# (`vendored`) lets us cross-compile (with cargo-zigbuild) and build natively on
+# the Pi without needing a system libssl. On macOS this is inert: native-tls uses
+# Security.framework, so this dependency is not compiled at all there.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }

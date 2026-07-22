@@ -27,9 +27,11 @@
 //!   un IPAM nel control plane).
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::proto::relay;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -42,6 +44,8 @@ pub const VPN_MAGIC: u8 = 0x76; // 'v'
 
 /// Subnet virtuale del tunnel.
 pub const TUN_NETMASK: [u8; 4] = [255, 255, 255, 0];
+/// MTU dell'interfaccia TUN (lascia spazio per WireGuard + relay + UDP/IP).
+pub const TUN_MTU: u16 = 1280;
 /// Indirizzo TUN dell'exit node.
 pub const EXIT_VIP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 1);
 
@@ -66,6 +70,62 @@ pub fn decap(datagram: &[u8]) -> Option<&[u8]> {
 /// `true` se il datagramma è traffico VPN (non un PING/ack di hole punching).
 pub fn is_vpn(datagram: &[u8]) -> bool {
     datagram.first() == Some(&VPN_MAGIC)
+}
+
+// -------------------------------------------------------------- endpoint ---
+//
+// Un peer del tunnel è raggiungibile in due modi, trasparenti al data plane:
+//   • `Direct`  — datagrammi WireGuard spediti direttamente al suo IP:porta
+//                 (hole punching riuscito, LAN, o port forwarding).
+//   • `Relay`   — spediti al server, che li inoltra al peer (stile DERP). È il
+//                 default: funziona ovunque, anche dietro CGNAT/NAT simmetrico.
+//
+// Le sessioni WireGuard sono indicizzate per `Endpoint` (identità del peer), non
+// per l'indirizzo di trasporto: così i pacchetti che arrivano tutti dal relay
+// non collassano su un'unica sessione.
+
+/// Come raggiungere un peer del tunnel.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Endpoint {
+    /// Invio diretto all'endpoint del peer.
+    Direct(SocketAddr),
+    /// Invio tramite relay sul server: `peer` è il `device_id` di destinazione.
+    Relay { relay: SocketAddr, peer: String },
+}
+
+impl Endpoint {
+    /// L'IP verso cui viaggiano davvero i datagrammi WireGuard (endpoint diretto
+    /// o server relay). È l'IP da tenere fuori dal full tunnel (rotta host).
+    pub fn wire_ip(&self) -> IpAddr {
+        match self {
+            Endpoint::Direct(a) => a.ip(),
+            Endpoint::Relay { relay, .. } => relay.ip(),
+        }
+    }
+
+    /// Serializza un datagramma WireGuard per questo endpoint e restituisce
+    /// `(bytes, destinazione)` pronti per `send_to`.
+    fn frame(&self, wg: &[u8]) -> (Vec<u8>, SocketAddr) {
+        match self {
+            Endpoint::Direct(a) => (encap(wg), *a),
+            Endpoint::Relay { relay, peer } => (relay::wrap(peer, wg), *relay),
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoint::Direct(a) => write!(f, "diretto {a}"),
+            Endpoint::Relay { relay, peer } => write!(f, "relay {relay} → {}…", &peer[..peer.len().min(8)]),
+        }
+    }
+}
+
+/// Invia un datagramma WireGuard grezzo verso `ep` (diretto o via relay).
+async fn send_wg(udp: &UdpSocket, ep: &Endpoint, wg: &[u8]) {
+    let (bytes, dst) = ep.frame(wg);
+    let _ = udp.send_to(&bytes, dst).await;
 }
 
 /// IP virtuale deterministico di un client a partire dal suo `device_id`.
@@ -148,20 +208,21 @@ pub mod crypto {
 // ricevitore nel client. Quando la feature `vpn` è attiva, i datagrammi VPN
 // vanno consegnati qui invece di essere stampati come PING.
 
-static VPN_INBOUND: Mutex<Option<UnboundedSender<(SocketAddr, Vec<u8>)>>> = Mutex::new(None);
+static VPN_INBOUND: Mutex<Option<UnboundedSender<(Endpoint, Vec<u8>)>>> = Mutex::new(None);
 
 /// Registra il canale su cui il ricevitore consegnerà i pacchetti VPN in arrivo.
-fn register_inbound() -> UnboundedReceiver<(SocketAddr, Vec<u8>)> {
+fn register_inbound() -> UnboundedReceiver<(Endpoint, Vec<u8>)> {
     let (tx, rx) = mpsc::unbounded_channel();
     *VPN_INBOUND.lock().unwrap() = Some(tx);
     rx
 }
 
-/// Consegna un datagramma VPN in arrivo al tunnel (chiamata dal ricevitore).
+/// Consegna un datagramma WireGuard in arrivo al tunnel (chiamata dal
+/// ricevitore), etichettato con l'`Endpoint` da cui proviene (diretto o relay).
 /// Ritorna `true` se un tunnel era in ascolto.
-pub fn deliver_inbound(src: SocketAddr, ip_packet: Vec<u8>) -> bool {
+pub fn deliver_inbound(from: Endpoint, wg_datagram: Vec<u8>) -> bool {
     match &*VPN_INBOUND.lock().unwrap() {
-        Some(tx) => tx.send((src, ip_packet)).is_ok(),
+        Some(tx) => tx.send((from, wg_datagram)).is_ok(),
         None => false,
     }
 }
@@ -178,9 +239,11 @@ fn new_session(my_sk: &crypto::StaticSecret, peer_pk: &crypto::PublicKey, index:
 }
 
 /// Cifra un pacchetto IP → datagramma WireGuard da spedire in rete.
+/// Con `ip_packet` vuoto forza l'invio dell'handshake iniziale (senza dati).
 async fn wg_encapsulate(sess: &Session, ip_packet: &[u8]) -> Option<Vec<u8>> {
     let mut t = sess.lock().await;
-    let mut buf = vec![0u8; ip_packet.len() + 64];
+    // Buffer ampio: l'handshake init è ~148 byte, più dei dati incapsulati.
+    let mut buf = vec![0u8; ip_packet.len() + 160];
     match t.encapsulate(ip_packet, &mut buf) {
         TunnResult::WriteToNetwork(d) => Some(d.to_vec()),
         _ => None,
@@ -213,6 +276,13 @@ async fn wg_decapsulate(sess: &Session, datagram: &[u8]) -> (Option<Vec<u8>>, Ve
     (plain, net)
 }
 
+/// `true` se un handshake WireGuard è stato completato almeno una volta (la
+/// sessione è cifrata e pronta): usato per decidere quando è sicuro dirottare
+/// tutto il traffico nel tunnel (full tunnel).
+async fn wg_handshake_done(sess: &Session) -> bool {
+    sess.lock().await.time_since_last_handshake().is_some()
+}
+
 /// Aggiorna i timer WireGuard (handshake/keepalive/rekey). Ritorna eventuali
 /// datagrammi da spedire.
 async fn wg_tick(sess: &Session) -> Vec<Vec<u8>> {
@@ -227,16 +297,23 @@ async fn wg_tick(sess: &Session) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------- tunnel client ---
 
 /// Avvia il tunnel **client** cifrato verso l'exit node. Richiede root.
+///
+/// Con `full_tunnel = true` dirotta **tutto** il traffico del sistema dentro il
+/// tunnel (VPN reale) non appena l'handshake WireGuard è confermato; con
+/// `false` crea solo l'interfaccia TUN (routing lasciato all'utente).
 pub fn spawn_client_tunnel(
     udp: Arc<UdpSocket>,
-    exit_addr: SocketAddr,
+    exit_ep: Endpoint,
     my_sk_b64: String,
     exit_pk_b64: String,
     my_vip: Ipv4Addr,
+    full_tunnel: bool,
 ) {
     let inbound = register_inbound();
     tokio::spawn(async move {
-        if let Err(e) = run_client_tunnel(udp, exit_addr, my_sk_b64, exit_pk_b64, my_vip, inbound).await {
+        if let Err(e) =
+            run_client_tunnel(udp, exit_ep, my_sk_b64, exit_pk_b64, my_vip, full_tunnel, inbound).await
+        {
             eprintln!("[vpn/client] errore: {e}");
         }
     });
@@ -244,29 +321,40 @@ pub fn spawn_client_tunnel(
 
 async fn run_client_tunnel(
     udp: Arc<UdpSocket>,
-    exit_addr: SocketAddr,
+    exit_ep: Endpoint,
     my_sk_b64: String,
     exit_pk_b64: String,
     my_vip: Ipv4Addr,
-    mut inbound: UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+    full_tunnel: bool,
+    mut inbound: UnboundedReceiver<(Endpoint, Vec<u8>)>,
 ) -> Result<(), String> {
     let my_sk = crypto::sk_from_b64(&my_sk_b64).ok_or("chiave privata non valida")?;
     let exit_pk = crypto::pk_from_b64(&exit_pk_b64).ok_or("chiave pubblica dell'exit non valida")?;
     let sess = new_session(&my_sk, &exit_pk, 1);
-    println!("[vpn/client] TUN {my_vip}/24 · uscita CIFRATA (WireGuard) via {exit_addr}");
+    println!("[vpn/client] TUN {my_vip}/24 · uscita CIFRATA (WireGuard) via {exit_ep}");
 
     let dev = open_tun(my_vip).map_err(|e| e.to_string())?;
     let (mut tun_r, tun_w) = tokio::io::split(dev);
     let tun_w = Arc::new(tokio::sync::Mutex::new(tun_w));
 
-    // Avvia l'handshake e mantieni i timer.
+    // Avvia SUBITO l'handshake, senza aspettare traffico dalla TUN: incapsulando
+    // un pacchetto vuoto boringtun emette l'handshake initiation. Senza questo
+    // kick si crea uno stallo (niente traffico → niente handshake → niente
+    // routing → niente traffico).
+    if let Some(dg) = wg_encapsulate(&sess, &[]).await {
+        send_wg(&udp, &exit_ep, &dg).await;
+        println!("[vpn/client] handshake WireGuard avviato verso {exit_ep}…");
+    }
+
+    // Mantieni i timer (ritrasmissioni handshake, keepalive, rekey).
     {
         let sess = sess.clone();
         let udp = udp.clone();
+        let exit_ep = exit_ep.clone();
         tokio::spawn(async move {
             loop {
                 for dg in wg_tick(&sess).await {
-                    let _ = udp.send_to(&encap(&dg), exit_addr).await;
+                    send_wg(&udp, &exit_ep, &dg).await;
                 }
                 sleep(Duration::from_millis(250)).await;
             }
@@ -277,6 +365,7 @@ async fn run_client_tunnel(
     {
         let sess = sess.clone();
         let udp = udp.clone();
+        let exit_ep = exit_ep.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
@@ -285,21 +374,47 @@ async fn run_client_tunnel(
                     Ok(n) => n,
                 };
                 if let Some(dg) = wg_encapsulate(&sess, &buf[..n]).await {
-                    let _ = udp.send_to(&encap(&dg), exit_addr).await;
+                    send_wg(&udp, &exit_ep, &dg).await;
                 }
             }
         });
     }
 
     // UDP (dal demux) → decifra → TUN (e rispedisci le risposte di handshake).
-    while let Some((_src, dg)) = inbound.recv().await {
+    // Quando l'handshake è confermato, se richiesto attiviamo il full tunnel
+    // (routing di tutto il traffico dentro il TUN) — una sola volta.
+    let mut routed = false;
+    let mut got_inbound = false;
+    while let Some((_from, dg)) = inbound.recv().await {
+        if !got_inbound {
+            got_inbound = true;
+            println!("[vpn/client] primo pacchetto cifrato ricevuto dall'exit ({} byte) — ritorno OK", dg.len());
+        }
         let (plain, net) = wg_decapsulate(&sess, &dg).await;
         for r in net {
-            let _ = udp.send_to(&encap(&r), exit_addr).await;
+            send_wg(&udp, &exit_ep, &r).await;
         }
         if let Some(p) = plain {
             let mut w = tun_w.lock().await;
             let _ = w.write_all(&p).await;
+        }
+        if full_tunnel && !routed && wg_handshake_done(&sess).await {
+            routed = true;
+            // Teniamo raggiungibile per la sua strada normale l'IP verso cui
+            // spediamo davvero i pacchetti WireGuard: l'exit se diretto, oppure
+            // il server relay. Così quei pacchetti non rientrano nel tunnel.
+            match exit_ep.wire_ip() {
+                IpAddr::V4(wire_ip) => {
+                    println!("[vpn/client] handshake OK → attivo il full tunnel (VPN reale)…");
+                    if let Err(e) = crate::route::apply_full_tunnel(wire_ip, my_vip) {
+                        eprintln!("[vpn/client] routing full tunnel non riuscito: {e}");
+                        eprintln!("[vpn/client] la rete è intatta; instrada a mano (vedi EXIT-NODE.md).");
+                    }
+                }
+                IpAddr::V6(_) => {
+                    eprintln!("[vpn/client] full tunnel non supportato su endpoint IPv6.");
+                }
+            }
         }
     }
     Ok(())
@@ -326,13 +441,15 @@ pub fn exit_add_peer(addr: SocketAddr, pk_b64: String) {
     }
 }
 
-fn exit_peer_key(addr: &SocketAddr) -> Option<String> {
-    EXIT_PEER_KEYS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(a, _)| a == addr)
-        .map(|(_, k)| k.clone())
+/// Tutte le chiavi pubbliche note dei client (senza duplicati). Serve all'exit
+/// per identificare il client anche quando l'indirizzo UDP da cui arriva
+/// l'handshake non combacia con quello annunciato dal server (NAT).
+fn all_peer_keys() -> Vec<String> {
+    let mut v: Vec<String> =
+        EXIT_PEER_KEYS.lock().unwrap().iter().map(|(_, k)| k.clone()).collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Avvia il tunnel lato **exit node**: decifra i pacchetti dei client, li
@@ -351,7 +468,7 @@ pub fn spawn_exit_node(udp: Arc<UdpSocket>, my_sk_b64: String, my_vip: Ipv4Addr)
 async fn run_exit_node(
     udp: Arc<UdpSocket>,
     my_vip: Ipv4Addr,
-    mut inbound: UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+    mut inbound: UnboundedReceiver<(Endpoint, Vec<u8>)>,
 ) -> Result<(), String> {
     let my_sk_b64 = EXIT_MY_SK.lock().unwrap().clone().ok_or("chiave privata mancante")?;
     let my_sk = crypto::sk_from_b64(&my_sk_b64).ok_or("chiave privata non valida")?;
@@ -361,10 +478,10 @@ async fn run_exit_node(
     let (mut tun_r, tun_w) = tokio::io::split(dev);
     let tun_w = Arc::new(tokio::sync::Mutex::new(tun_w));
 
-    // Sessione per client (per endpoint) e mappa IP virtuale → endpoint client.
-    let sessions: Arc<tokio::sync::Mutex<HashMap<SocketAddr, Session>>> =
+    // Sessione per client (per Endpoint) e mappa IP virtuale → Endpoint client.
+    let sessions: Arc<tokio::sync::Mutex<HashMap<Endpoint, Session>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let routes: Arc<Mutex<HashMap<Ipv4Addr, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+    let routes: Arc<Mutex<HashMap<Ipv4Addr, Endpoint>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // TUN (risposte da Internet, de-NATtate) → cifra → UDP verso il client giusto.
     {
@@ -379,12 +496,12 @@ async fn run_exit_node(
                     Ok(n) => n,
                 };
                 let Some(dst) = ipv4_dst(&buf[..n]) else { continue };
-                let addr = routes.lock().unwrap().get(&dst).copied();
-                let Some(addr) = addr else { continue };
-                let sess = sessions.lock().await.get(&addr).cloned();
+                let ep = routes.lock().unwrap().get(&dst).cloned();
+                let Some(ep) = ep else { continue };
+                let sess = sessions.lock().await.get(&ep).cloned();
                 if let Some(sess) = sess {
                     if let Some(dg) = wg_encapsulate(&sess, &buf[..n]).await {
-                        let _ = udp.send_to(&encap(&dg), addr).await;
+                        send_wg(&udp, &ep, &dg).await;
                     }
                 }
             }
@@ -398,11 +515,11 @@ async fn run_exit_node(
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_millis(250)).await;
-                let all: Vec<(SocketAddr, Session)> =
-                    sessions.lock().await.iter().map(|(a, s)| (*a, s.clone())).collect();
-                for (addr, s) in all {
+                let all: Vec<(Endpoint, Session)> =
+                    sessions.lock().await.iter().map(|(a, s)| (a.clone(), s.clone())).collect();
+                for (ep, s) in all {
                     for dg in wg_tick(&s).await {
-                        let _ = udp.send_to(&encap(&dg), addr).await;
+                        send_wg(&udp, &ep, &dg).await;
                     }
                 }
             }
@@ -411,29 +528,58 @@ async fn run_exit_node(
 
     let mut index: u32 = 100;
     // UDP (dai client, via demux) → decifra → impara la rotta → TUN → Internet.
-    while let Some((src, dg)) = inbound.recv().await {
-        let sess = {
-            let mut map = sessions.lock().await;
-            match map.get(&src) {
-                Some(s) => s.clone(),
-                None => match exit_peer_key(&src).and_then(|k| crypto::pk_from_b64(&k)) {
-                    Some(pk) => {
-                        index += 1;
-                        let s = new_session(&my_sk, &pk, index);
-                        map.insert(src, s.clone());
-                        s
+    while let Some((ep, dg)) = inbound.recv().await {
+        // Sessione già nota per questo Endpoint?
+        let existing = sessions.lock().await.get(&ep).cloned();
+        let sess = match existing {
+            Some(s) => s,
+            None => {
+                // Client nuovo: prova tutte le chiavi note finché una decifra
+                // davvero questo datagramma (gestisce anche il caso in cui l'IP
+                // di provenienza non combacia con quello annunciato dal server).
+                let keys = all_peer_keys();
+                println!("[vpn/exit] datagramma VPN da {ep}: provo {} chiavi note", keys.len());
+                let mut chosen: Option<Session> = None;
+                for k in keys {
+                    let Some(pk) = crypto::pk_from_b64(&k) else { continue };
+                    index += 1;
+                    let candidate = new_session(&my_sk, &pk, index);
+                    let (plain, net) = wg_decapsulate(&candidate, &dg).await;
+                    if !net.is_empty() || plain.is_some() {
+                        // Chiave giusta: registra la sessione e gestisci l'output.
+                        sessions.lock().await.insert(ep.clone(), candidate.clone());
+                        println!("[vpn/exit] sessione WireGuard avviata con client {ep}");
+                        for r in net {
+                            send_wg(&udp, &ep, &r).await;
+                        }
+                        if let Some(p) = plain {
+                            if let Some(vip) = ipv4_src(&p) {
+                                routes.lock().unwrap().insert(vip, ep.clone());
+                            }
+                            let mut w = tun_w.lock().await;
+                            let _ = w.write_all(&p).await;
+                        }
+                        chosen = Some(candidate);
+                        break;
                     }
-                    None => continue, // chiave pubblica del client sconosciuta
-                },
+                }
+                if chosen.is_none() {
+                    // Nessuna chiave nota decifra: la chiave del client non è
+                    // ancora arrivata dal server. Riproverà al prossimo pacchetto.
+                    println!("[vpn/exit] nessuna chiave nota decifra il datagramma da {ep} (client non ancora annunciato dal server?)");
+                    continue;
+                }
+                continue; // datagramma già gestito qui sopra
             }
         };
+        // Sessione esistente: percorso normale.
         let (plain, net) = wg_decapsulate(&sess, &dg).await;
         for r in net {
-            let _ = udp.send_to(&encap(&r), src).await;
+            send_wg(&udp, &ep, &r).await;
         }
         if let Some(p) = plain {
             if let Some(vip) = ipv4_src(&p) {
-                routes.lock().unwrap().insert(vip, src);
+                routes.lock().unwrap().insert(vip, ep.clone());
             }
             let mut w = tun_w.lock().await;
             let _ = w.write_all(&p).await;
@@ -475,6 +621,10 @@ fn open_tun(vip: Ipv4Addr) -> std::io::Result<tun::AsyncDevice> {
     config
         .address(vip)
         .netmask(Ipv4Addr::from(TUN_NETMASK))
+        // MTU contenuta: il payload viene incapsulato in WireGuard e (via relay)
+        // di nuovo in UDP verso il server. 1280 lascia margine abbondante per gli
+        // header ed evita frammentazione/perdite sul percorso relay.
+        .mtu(TUN_MTU)
         .up();
     tun::create_as_async(&config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
@@ -588,6 +738,124 @@ mod tests {
 
         assert!(cipher_seen, "deve esserci traffico cifrato sulla rete");
         assert_eq!(received.as_deref(), Some(&payload[..]), "B deve recuperare il pacchetto in chiaro");
+    }
+
+    /// End-to-end del **percorso relay**: due sessioni WireGuard completano
+    /// l'handshake e si scambiano un pacchetto passando *solo* dal relay (nessun
+    /// invio diretto), su socket UDP reali (loopback). Verifica che framing,
+    /// riscrittura del mittente (`Table::route`) e sessioni-per-identità
+    /// compongano correttamente — la parte che non richiede TUN/root.
+    #[tokio::test]
+    async fn wireguard_handshake_over_relay() {
+        use crate::proto::relay;
+        use boringtun::noise::TunnResult;
+        use std::sync::Arc;
+        use tokio::net::UdpSocket;
+
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        // Relay: tabella precompilata (come dopo i keepalive) + loop di inoltro.
+        let mut table = relay::Table::default();
+        table.upsert("A", a.local_addr().unwrap());
+        table.upsert("B", b.local_addr().unwrap());
+        let table = Arc::new(std::sync::Mutex::new(table));
+        {
+            let (server, table) = (server.clone(), table.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                loop {
+                    let (n, src) = server.recv_from(&mut buf).await.unwrap();
+                    let out = table.lock().unwrap().route(src, &buf[..n]);
+                    if let Some((bytes, dst)) = out {
+                        let _ = server.send_to(&bytes, dst).await;
+                    }
+                }
+            });
+        }
+
+        let (a_sk, a_pk) = crypto::gen_keypair();
+        let (b_sk, b_pk) = crypto::gen_keypair();
+
+        // Pacchetto IPv4 valido di prova (boringtun cifra fino a total-length).
+        let mut payload = vec![0u8; 40];
+        payload[0] = 0x45;
+        payload[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        payload[12..16].copy_from_slice(&[10, 7, 0, 2]);
+        payload[16..20].copy_from_slice(&[10, 7, 0, 1]);
+        let expected = payload.clone();
+
+        // Exit "B": decifra i frame; sul pacchetto in chiaro segnala via canale.
+        // Le risposte di rete tornano al mittente letto dal frame (riscritto ad "A").
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let b = b.clone();
+            let mut tun = crypto::new_tunn(&b_sk, &a_pk, 2);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                loop {
+                    let (n, _src) = b.recv_from(&mut buf).await.unwrap();
+                    let Some((peer_id, wg)) = relay::parse(&buf[..n]) else { continue };
+                    let peer_id = peer_id.to_string();
+                    let mut out = vec![0u8; 2048];
+                    match tun.decapsulate(None, wg, &mut out) {
+                        TunnResult::WriteToNetwork(d) => {
+                            let _ = b.send_to(&relay::wrap(&peer_id, d), server_addr).await;
+                            loop {
+                                let mut fb = vec![0u8; 2048];
+                                match tun.decapsulate(None, &[], &mut fb) {
+                                    TunnResult::WriteToNetwork(d) => {
+                                        let _ = b.send_to(&relay::wrap(&peer_id, d), server_addr).await;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        TunnResult::WriteToTunnelV4(p, _) => {
+                            let _ = tx.send(p.to_vec());
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // Client "A": avvia l'handshake e, una volta stabilito, invia il payload.
+        {
+            let a = a.clone();
+            let mut tun = crypto::new_tunn(&a_sk, &b_pk, 1);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                if let TunnResult::WriteToNetwork(d) = tun.encapsulate(&[], &mut buf) {
+                    let _ = a.send_to(&relay::wrap("B", d), server_addr).await;
+                }
+                let mut sent_data = false;
+                let mut rbuf = vec![0u8; 2048];
+                loop {
+                    let (n, _src) = a.recv_from(&mut rbuf).await.unwrap();
+                    let Some((_peer, wg)) = relay::parse(&rbuf[..n]) else { continue };
+                    let mut out = vec![0u8; 2048];
+                    if let TunnResult::WriteToNetwork(d) = tun.decapsulate(None, wg, &mut out) {
+                        let _ = a.send_to(&relay::wrap("B", d), server_addr).await;
+                    }
+                    if !sent_data && tun.time_since_last_handshake().is_some() {
+                        sent_data = true;
+                        let mut eb = vec![0u8; 2048];
+                        if let TunnResult::WriteToNetwork(d) = tun.encapsulate(&payload, &mut eb) {
+                            let _ = a.send_to(&relay::wrap("B", d), server_addr).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout: handshake via relay non completato")
+            .expect("canale chiuso");
+        assert_eq!(got, expected, "B deve ricevere in chiaro il payload di A, passando dal relay");
     }
 
     #[test]

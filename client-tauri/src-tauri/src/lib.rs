@@ -1,36 +1,36 @@
-//! Core Rust del client desktop (Tauri v2).
+//! Core Rust del client desktop (Tauri v2) — pannello di controllo VPN.
 //!
-//! Il frontend (HTML/JS) chiama i comandi qui sotto via `invoke` e riceve gli
-//! aggiornamenti tramite gli eventi `log` e `status`. Tutta la rete
-//! (device-code login, segnalazione TCP, hole punching UDP) vive qui, riusando
-//! il protocollo condiviso `p2p_holepunch::proto`.
+//! La GUI **non** fa da sola il data plane: pilota l'eseguibile CLI
+//! (`p2p-client`, bundlato nell'app come resource), che è l'unico a creare il
+//! tunnel cifrato e a instradare il traffico. Motivo: il server tiene **una
+//! sola** connessione per identità, quindi non possiamo avere GUI e tunnel
+//! connessi insieme — la GUI apre una connessione alla volta, tramite la CLI.
+//!
+//! Flusso:
+//! - **Login**: device-code via browser (come prima), salva l'identità condivisa.
+//! - **Elenco exit**: `p2p-client --list-exits` (connessione breve, poi esce).
+//! - **VPN On**: lancia `sudo p2p-client --use-exit <nome>` con un prompt di
+//!   amministratore (macOS lo impone per creare il TUN e cambiare il routing).
+//! - **VPN Off**: manda SIGINT alla CLI, che ripristina il routing ed esce.
 
-use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::async_runtime::JoinHandle;
-use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::time::{interval, sleep};
+use tauri::AppHandle;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::sleep;
 
-use p2p_holepunch::{ClientMessage, ServerMessage, UdpMessage};
-
-/// Canale verso il writer TCP (per inviare messaggi dopo la connessione).
-static OUTBOUND: Mutex<Option<UnboundedSender<ClientMessage>>> = Mutex::new(None);
-/// Exit node disponibili appresi dalla mesh: (nome, device_id).
-static EXIT_PEERS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+// Percorsi dei file di lavoro del tunnel (log/PID e script per il prompt admin).
+const LOG_PATH: &str = "/tmp/p2p-vpn.log";
+const PID_PATH: &str = "/tmp/p2p-vpn.pid";
+const START_SCRIPT: &str = "/tmp/p2p-vpn-start.sh";
+const STOP_SCRIPT: &str = "/tmp/p2p-vpn-stop.sh";
 
 // Default sovrascrivibili via variabili d'ambiente (come il client CLI).
-const DEFAULT_SERVER: &str = "127.0.0.1";
-const HTTP_PORT: u16 = 8080;
-const TCP_PORT: u16 = 47100;
-const UDP_PORT: u16 = 47101;
+const DEFAULT_SERVER: &str = "abc.edoardocasella.it";
+const HTTP_PORT: u16 = 443;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -67,7 +67,7 @@ fn save_config(cfg: &Config) -> std::io::Result<()> {
     std::fs::write(&path, serde_json::to_string_pretty(cfg)?)
 }
 
-// -------------------------------------------------------------- comandi ---
+// -------------------------------------------------------------- login ---
 
 #[derive(Serialize)]
 struct StateInfo {
@@ -145,228 +145,262 @@ async fn login_wait(code: String) -> Result<String, String> {
     }
 }
 
-/// Avvia la segnalazione in background. Gli aggiornamenti arrivano al frontend
-/// via eventi `log`/`status`. Ritorna subito.
-#[tauri::command]
-async fn connect(app: AppHandle) -> Result<(), String> {
-    let cfg = load_config().ok_or("dispositivo non autenticato")?;
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_signaling(app.clone(), cfg).await {
-            let _ = app.emit("log", format!("Errore: {e}"));
-            let _ = app.emit("status", "error");
-        }
-    });
-    Ok(())
-}
+// --------------------------------------------------------- controllo VPN ---
 
-/// Elenco dei nomi degli exit node disponibili (per il selettore in UI).
-#[tauri::command]
-fn list_exits() -> Vec<String> {
-    EXIT_PEERS.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
-}
-
-/// Sceglie (o annulla, con `name` vuoto) l'exit node attraverso cui uscire.
-#[tauri::command]
-fn use_exit(name: String) -> Result<(), String> {
-    let exit_device_id = if name.is_empty() {
-        None
-    } else {
-        let id = EXIT_PEERS
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(n, _)| n == &name)
-            .map(|(_, id)| id.clone());
-        match id {
-            Some(id) => Some(id),
-            None => return Err("exit node non trovato".into()),
+/// Percorso dell'eseguibile CLI `p2p-client`: prima come resource bundlata
+/// nell'app, poi override via env, poi installazione di sistema.
+fn cli_path(app: &AppHandle) -> PathBuf {
+    use tauri::Manager;
+    if let Ok(p) = app.path().resolve("bin/p2p-client", tauri::path::BaseDirectory::Resource) {
+        if p.exists() {
+            ensure_executable(&p);
+            return p;
         }
-    };
-    let tx = OUTBOUND.lock().unwrap().clone();
-    match tx {
-        Some(tx) => tx
-            .send(ClientMessage::UseExitNode { exit_device_id })
-            .map_err(|_| "non connesso".to_string()),
-        None => Err("non connesso: premi prima Connetti".to_string()),
     }
+    if let Ok(p) = std::env::var("P2P_CLI") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return pb;
+        }
+    }
+    let common = PathBuf::from("/usr/local/bin/p2p-client");
+    if common.exists() {
+        return common;
+    }
+    PathBuf::from("p2p-client")
 }
 
-// --------------------------------------------------------- rete / logica ---
+/// Elenca gli exit node disponibili eseguendo `p2p-client --list-exits`.
+/// Richiede di essere già loggati (la GUI lo garantisce mostrando prima il login).
+#[tauri::command]
+async fn vpn_list_exits(app: AppHandle) -> Result<Vec<String>, String> {
+    let cli = cli_path(&app).to_string_lossy().to_string();
+    let home = std::env::var("HOME").unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = std::process::Command::new(&cli)
+            .arg("--list-exits")
+            .env("HOME", &home)
+            .output()
+            .map_err(|e| format!("impossibile eseguire il client ({cli}): {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Righe tipo "  • raspberry-casa   (id: abc123)".
+        let exits: Vec<String> = text
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim_start().strip_prefix("• ")?;
+                let name = rest.split("   (id:").next().unwrap_or(rest).trim();
+                (!name.is_empty()).then(|| name.to_string())
+            })
+            .collect();
+        Ok(exits)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
-async fn run_signaling(app: AppHandle, cfg: Config) -> Result<(), String> {
-    let host = server_host();
-    let server_tcp = resolve(&host, port("P2P_TCP_PORT", TCP_PORT)).await.map_err(|e| e.to_string())?;
-    let server_udp = resolve(&host, port("P2P_UDP_PORT", UDP_PORT)).await.map_err(|e| e.to_string())?;
+/// Escapa una stringa per inserirla tra apici singoli in uno script sh.
+fn sh_squote(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
 
-    let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?);
-    let _ = app.emit("status", "connecting");
-    let _ = app.emit("log", format!("Socket UDP locale su {}", udp.local_addr().unwrap()));
-
-    EXIT_PEERS.lock().unwrap().clear();
-
-    // TCP + autenticazione con auth_key.
-    let tcp = TcpStream::connect(server_tcp).await.map_err(|e| e.to_string())?;
-    let (read_half, mut write_half) = tcp.into_split();
-    let mut lines = BufReader::new(read_half).lines();
-
-    // Writer task: invia i ClientMessage (Register, UseExitNode…) sul canale TCP.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ClientMessage>();
-    *OUTBOUND.lock().unwrap() = Some(out_tx.clone());
-    tauri::async_runtime::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let mut d = serde_json::to_vec(&msg).unwrap_or_default();
-            d.push(b'\n');
-            if write_half.write_all(&d).await.is_err() {
-                break;
-            }
-        }
-    });
-    let _ = out_tx.send(ClientMessage::Register { auth_key: cfg.auth_key.clone(), wg_public: None });
-    let _ = app.emit("log", "Autenticazione inviata.".to_string());
-
-    // Keepalive UDP: pubblica e mantiene fresco il nostro endpoint (per la mesh).
+/// Garantisce il bit di esecuzione sul binario (le resource Tauri talvolta lo
+/// perdono nella copia). Best effort, solo su Unix.
+fn ensure_executable(path: &std::path::Path) {
+    #[cfg(unix)]
     {
-        let udp = udp.clone();
-        let device_id = cfg.device_id.clone();
-        tauri::async_runtime::spawn(async move {
-            let payload = serde_json::to_vec(&UdpMessage::UdpRegister { device_id }).unwrap();
-            loop {
-                let _ = udp.send_to(&payload, server_udp).await;
-                sleep(Duration::from_secs(3)).await;
-            }
-        });
-    }
-
-    // Ricevitore unico dei pacchetti da tutti i peer.
-    spawn_receiver(app.clone(), udp.clone(), server_udp);
-
-    let _ = app.emit("log", "In attesa dei peer dell'account (mesh)…".to_string());
-
-    // Un sender per ogni peer della mesh, indicizzato per device_id.
-    let mut senders: HashMap<String, (SocketAddr, JoinHandle<()>)> = HashMap::new();
-    loop {
-        let line = match lines.next_line().await.map_err(|e| e.to_string())? {
-            Some(l) => l,
-            None => return Err("il server ha chiuso la connessione".to_string()),
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<ServerMessage>(&line).map_err(|e| e.to_string())? {
-            ServerMessage::Registered { info, .. } => {
-                let _ = app.emit("status", "registered");
-                let _ = app.emit("log", info);
-            }
-            ServerMessage::Waiting => {
-                let _ = app.emit("log", "Registrato. In attesa di peer…".to_string());
-            }
-            ServerMessage::Error { message } => return Err(message),
-            ServerMessage::PeerInfo { peer_id, peer_name, peer_addr, is_exit_node, .. } => {
-                if senders.get(&peer_id).map(|(a, _)| *a) != Some(peer_addr) {
-                    if let Some((_, old)) = senders.remove(&peer_id) {
-                        old.abort();
-                    }
-                    let _ = app.emit("status", "punching");
-                    let tag = if is_exit_node { " [exit node]" } else { "" };
-                    let _ = app.emit(
-                        "log",
-                        format!("Peer '{peer_name}'{tag} @ {peer_addr} → hole punching"),
-                    );
-                    let handle = spawn_sender(udp.clone(), peer_addr);
-                    senders.insert(peer_id.clone(), (peer_addr, handle));
-                }
-                // Aggiorna l'elenco degli exit node disponibili per il selettore.
-                if is_exit_node {
-                    let mut list = EXIT_PEERS.lock().unwrap();
-                    if !list.iter().any(|(_, id)| id == &peer_id) {
-                        list.push((peer_name.clone(), peer_id.clone()));
-                    }
-                    let names: Vec<String> = list.iter().map(|(n, _)| n.clone()).collect();
-                    drop(list);
-                    let _ = app.emit("exit_nodes", names);
-                }
-            }
-            ServerMessage::PeerGone { peer_id } => {
-                if let Some((addr, h)) = senders.remove(&peer_id) {
-                    h.abort();
-                    let _ = app.emit("log", format!("Peer '{peer_id}' offline ({addr})"));
-                }
-            }
-            ServerMessage::ExitNodeSet { ok, message, .. } => {
-                let _ = app.emit("log", format!("[exit node] {message}"));
-                let _ = ok;
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perm = meta.permissions();
+            if perm.mode() & 0o111 == 0 {
+                perm.set_mode(perm.mode() | 0o755);
+                let _ = std::fs::set_permissions(path, perm);
             }
         }
     }
 }
 
-/// Invia PING periodici verso un peer (apre il NAT locale).
-fn spawn_sender(udp: Arc<UdpSocket>, peer_addr: SocketAddr) -> JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        let mut ticker = interval(Duration::from_millis(500));
-        let mut n: u64 = 0;
-        loop {
-            ticker.tick().await;
-            n += 1;
-            let msg = format!("PING #{n} (hole-punch)");
-            if udp.send_to(msg.as_bytes(), peer_addr).await.is_err() {
-                break;
+/// Accende la VPN: lancia `p2p-client --use-exit <name>` come root (prompt di
+/// amministratore), in background, salvando log e PID. Ritorna il PID.
+#[tauri::command]
+async fn vpn_start(app: AppHandle, name: String) -> Result<u32, String> {
+    if name.trim().is_empty() {
+        return Err("scegli prima un exit node".into());
+    }
+    let cli = cli_path(&app).to_string_lossy().to_string();
+    let home = std::env::var("HOME").unwrap_or_default();
+    // Script eseguito come root: HOME=<utente> per ritrovare l'identità del
+    // login, avvia il tunnel in background e salva il PID.
+    // `LC_ALL=C` evita l'errore "illegal byte sequence" di pkill/grep su macOS.
+    // Prima di avviare, uccide ogni istanza precedente: evita più processi con la
+    // stessa identità che si scalzano a vicenda sul server (endpoint instabile).
+    let script = format!(
+        "#!/bin/sh\nexport LC_ALL=C\npkill -9 -f 'p2p-client --use-exit' 2>/dev/null || true\nsleep 1\nrm -f {pid}\nHOME='{home}' '{cli}' --use-exit '{name}' > {log} 2>&1 &\necho $! > {pid}\n",
+        home = sh_squote(&home),
+        cli = sh_squote(&cli),
+        name = sh_squote(&name),
+        log = LOG_PATH,
+        pid = PID_PATH,
+    );
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = std::fs::remove_file(PID_PATH);
+        std::fs::write(START_SCRIPT, script).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!("do shell script \"/bin/sh {START_SCRIPT}\" with administrator privileges"),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            // -128 = l'utente ha annullato il prompt password.
+            if err.contains("-128") {
+                return Err("operazione annullata".into());
             }
+            return Err(format!("avvio VPN fallito: {}", err.trim()));
         }
+        std::fs::read_to_string(PID_PATH)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .ok_or_else(|| "VPN avviata ma PID non disponibile".to_string())
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// Ricevitore unico del socket UDP: emette gli eventi dei pacchetti dai peer,
-/// ignorando quelli del server. Segnala il primo contatto con ogni peer.
-fn spawn_receiver(app: AppHandle, udp: Arc<UdpSocket>, server_udp: SocketAddr) -> JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        let mut buf = vec![0u8; 2048];
-        let mut established: HashSet<IpAddr> = HashSet::new();
-        loop {
-            let (n, src) = match udp.recv_from(&mut buf).await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            if src == server_udp {
-                continue;
+/// Spegne la VPN: manda SIGINT alla CLI (che ripristina il routing ed esce).
+/// Usa il PID salvato e, come rete di sicurezza, `pkill` sul pattern del comando
+/// (così funziona anche se il PID è stantìo).
+#[tauri::command]
+async fn vpn_stop() -> Result<(), String> {
+    let pid = std::fs::read_to_string(PID_PATH)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    // Se non c'è né PID né processo attivo, non serve chiedere la password.
+    if pid.is_none() && !any_vpn_process() {
+        let _ = std::fs::remove_file(PID_PATH);
+        return Ok(());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let kill_pid = pid
+            .map(|p| format!("kill {p} 2>/dev/null || true\n"))
+            .unwrap_or_default();
+        // Usiamo SIGTERM (non SIGINT): un processo avviato in background dalla
+        // shell ha SIGINT impostato su IGNORE, quindi `kill -INT` non lo tocca.
+        // La CLI gestisce SIGTERM (ripristina il routing ed esce). Dopo 2s, come
+        // ultima spiaggia, SIGKILL. `LC_ALL=C` evita l'errore di locale di pkill.
+        // Il pidfile è di root: lo rimuoviamo qui dentro (come root).
+        let script = format!(
+            "#!/bin/sh\nexport LC_ALL=C\n{kill_pid}pkill -f 'p2p-client --use-exit' 2>/dev/null || true\nsleep 2\npkill -9 -f 'p2p-client --use-exit' 2>/dev/null || true\nrm -f {PID_PATH}\nexit 0\n"
+        );
+        std::fs::write(STOP_SCRIPT, script).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!("do shell script \"/bin/sh {STOP_SCRIPT}\" with administrator privileges"),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("-128") {
+                return Err("operazione annullata".into());
             }
-            let text = String::from_utf8_lossy(&buf[..n]);
-            if established.insert(src.ip()) {
-                let _ = app.emit("status", "connected");
-                let _ = app.emit("log", format!("✅ Connessione P2P diretta stabilita con {src}!"));
-            }
-            let _ = app.emit("log", format!("<< da {src}: {}", text.trim()));
+            return Err(format!("stop VPN fallito: {}", err.trim()));
         }
+        let _ = std::fs::remove_file(PID_PATH);
+        Ok(())
     })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// `true` se esiste un processo del tunnel VPN in esecuzione (fallback per lo stato).
+fn any_vpn_process() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", "p2p-client --use-exit"])
+        .env("LC_ALL", "C")
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+#[derive(Serialize)]
+struct VpnStatus {
+    running: bool,
+    log: String,
+}
+
+/// Stato del tunnel: la CLI è ancora viva? + ultime righe di log per la UI.
+#[tauri::command]
+async fn vpn_status() -> VpnStatus {
+    tauri::async_runtime::spawn_blocking(|| {
+        let pid = std::fs::read_to_string(PID_PATH)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let running = pid.map(process_alive).unwrap_or(false) || any_vpn_process();
+        VpnStatus { running, log: tail_file(LOG_PATH, 60) }
+    })
+    .await
+    .unwrap_or(VpnStatus { running: false, log: String::new() })
+}
+
+/// `true` se il processo con quel PID è ancora attivo (anche se è di root).
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().count() > 1)
+        .unwrap_or(false)
+}
+
+/// Ultime `n` righe di un file di testo (best effort).
+fn tail_file(path: &str, n: usize) -> String {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 // ----------------------------------------------------------- utilità ---
 
-async fn resolve(host: &str, p: u16) -> std::io::Result<SocketAddr> {
-    tokio::net::lookup_host((host, p))
-        .await?
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "host non risolto"))
-}
-
-/// HTTP/1.1 in chiaro verso il backoffice (nessun TLS: solo il nostro server).
+/// HTTP/1.1 verso il backoffice. Se la porta è 443 usa TLS (produzione dietro
+/// nginx/HTTPS), altrimenti va in chiaro (dev locale). Usato solo al login.
 async fn http_request(
     host_port: &str,
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect(host_port).await?;
     let body = body.unwrap_or("");
+    // Host header e SNI senza la porta.
+    let host = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port);
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
-    stream.write_all(req.as_bytes()).await?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await?;
+    let tcp = TcpStream::connect(host_port).await?;
+    let raw = if host_port.ends_with(":443") {
+        let connector = tokio_native_tls::native_tls::TlsConnector::new()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut stream = tokio_native_tls::TlsConnector::from(connector)
+            .connect(host, tcp)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        stream.write_all(req.as_bytes()).await?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await?;
+        raw
+    } else {
+        let mut stream = tcp;
+        stream.write_all(req.as_bytes()).await?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await?;
+        raw
+    };
     let text = String::from_utf8_lossy(&raw);
     Ok(match text.find("\r\n\r\n") {
         Some(i) => text[i + 4..].to_string(),
@@ -396,9 +430,10 @@ pub fn run() {
             logout,
             login_start,
             login_wait,
-            connect,
-            list_exits,
-            use_exit
+            vpn_list_exits,
+            vpn_start,
+            vpn_stop,
+            vpn_status
         ])
         .run(tauri::generate_context!())
         .expect("errore nell'avvio dell'app Tauri");

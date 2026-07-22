@@ -29,12 +29,19 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 
 use p2p_holepunch::db;
+use p2p_holepunch::proto::relay;
 use p2p_holepunch::web::{self, AppState, Live, LiveDevice};
 use p2p_holepunch::{ClientMessage, ServerMessage, UdpMessage};
 
 // Porte di segnalazione (devono combaciare con quelle del client).
 const TCP_PORT: u16 = 47100;
 const UDP_PORT: u16 = 47101;
+
+/// Tabella del relay condivisa (id ↔ endpoint), dietro un `std::sync::Mutex`
+/// (lock brevissimo, niente await) per non contendere il `Mutex` async dello
+/// stato `live` sul percorso caldo dei dati VPN. La logica vive in
+/// `proto::relay::Table` (così è testabile e riusata).
+type Relay = Arc<std::sync::Mutex<relay::Table>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,6 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stato live: dispositivi collegati in questo momento.
     let live: Live = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // Tabella del relay VPN (id ↔ endpoint), condivisa tra UDP e TCP.
+    let relay: Relay = Arc::new(std::sync::Mutex::new(relay::Table::default()));
 
     // --- HTTP: backoffice web ---
     let state = AppState {
@@ -69,17 +78,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- UDP: apprendimento endpoint pubblici ---
+    // --- UDP: apprendimento endpoint pubblici + relay VPN ---
     let udp = Arc::new(UdpSocket::bind(("0.0.0.0", UDP_PORT)).await?);
-    println!("[Server] UDP in ascolto su 0.0.0.0:{UDP_PORT}");
-    tokio::spawn(run_udp(udp.clone(), live.clone()));
+    println!("[Server] UDP in ascolto su 0.0.0.0:{UDP_PORT} (endpoint + relay VPN)");
+    tokio::spawn(run_udp(udp.clone(), live.clone(), relay.clone()));
 
     // --- TCP: segnalazione ---
     let tcp = TcpListener::bind(("0.0.0.0", TCP_PORT)).await?;
     println!("[Server] TCP di segnalazione in ascolto su 0.0.0.0:{TCP_PORT}");
     loop {
         let (stream, peer) = tcp.accept().await?;
-        tokio::spawn(handle_tcp(stream, peer, db.clone(), live.clone()));
+        tokio::spawn(handle_tcp(stream, peer, db.clone(), live.clone(), relay.clone()));
     }
 }
 
@@ -89,6 +98,7 @@ async fn handle_tcp(
     peer: SocketAddr,
     db: Arc<Mutex<rusqlite::Connection>>,
     live: Live,
+    relay: Relay,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -228,17 +238,20 @@ async fn handle_tcp(
         }
     }
 
-    // Connessione caduta: rimuovi dallo stato live e avvisa la mesh.
+    // Connessione caduta: rimuovi dallo stato live + relay e avvisa la mesh.
     if let Some((id, user_id)) = identity {
         live.lock().await.remove(&id);
+        relay.lock().unwrap().remove(&id);
         web::peer_gone(&live, user_id, &id).await;
         println!("[TCP] Offline device_id={id}");
     }
 }
 
-/// Riceve i datagrammi UDP e aggiorna l'endpoint pubblico di ogni dispositivo.
-async fn run_udp(socket: Arc<UdpSocket>, live: Live) {
-    let mut buf = vec![0u8; 2048];
+/// Riceve i datagrammi UDP: apprende gli endpoint pubblici (JSON `UdpRegister`)
+/// e **instrada i frame di relay VPN** (byte magico `0x72`) tra i dispositivi.
+async fn run_udp(socket: Arc<UdpSocket>, live: Live, relay: Relay) {
+    // Buffer ampio: i frame di relay portano un pacchetto WireGuard (fino a ~1.4 KB).
+    let mut buf = vec![0u8; 4096];
     loop {
         let (n, src) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -247,6 +260,18 @@ async fn run_udp(socket: Arc<UdpSocket>, live: Live) {
                 continue;
             }
         };
+
+        // --- Percorso caldo: frame di relay VPN ---
+        // Non è JSON: è un datagramma WireGuard cifrato da inoltrare. Riscriviamo
+        // l'id di destinazione con quello del mittente (così il destinatario sa
+        // da chi arriva) e lo spediamo al suo endpoint pubblico.
+        if relay::is_relay(&buf[..n]) {
+            let out = relay.lock().unwrap().route(src, &buf[..n]);
+            if let Some((bytes, dst_addr)) = out {
+                let _ = socket.send_to(&bytes, dst_addr).await;
+            }
+            continue;
+        }
 
         let text = String::from_utf8_lossy(&buf[..n]);
         let msg: UdpMessage = match serde_json::from_str(text.trim()) {
@@ -259,6 +284,8 @@ async fn run_udp(socket: Arc<UdpSocket>, live: Live) {
 
         match msg {
             UdpMessage::UdpRegister { device_id } => {
+                // Aggiorna la tabella del relay: id ↔ endpoint pubblico corrente.
+                relay.lock().unwrap().upsert(&device_id, src);
                 // Se l'endpoint è nuovo/cambiato, memorizziamo l'utente per
                 // (ri)formare la mesh dopo aver rilasciato il lock.
                 let (known, changed_user) = {
